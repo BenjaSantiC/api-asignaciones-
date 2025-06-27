@@ -1,8 +1,9 @@
-from fastapi import FastAPI, UploadFile, Form, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from openpyxl import load_workbook
 from datetime import datetime
-import tempfile, shutil
+import tempfile, base64, io
 
 app = FastAPI()
 
@@ -22,22 +23,29 @@ tiempo_por_rol = {
 }
 HORAS_MENSUALES = 160
 
+# Modelo para recibir JSON
+class AsignacionRequest(BaseModel):
+    plan: str
+    archivo_base64: str
+
 @app.post("/asignar_plan")
-async def asignar_plan(plan: str = Form(...), archivo: UploadFile = Form(...)):
+def asignar_plan(req: AsignacionRequest):
+    plan = req.plan
     if plan not in ["Plata", "Gold", "Platinum"]:
         raise HTTPException(status_code=400, detail="Tipo de plan inválido.")
 
-    # Guardar temporalmente el archivo
-    temp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    with open(temp.name, "wb") as f:
-        shutil.copyfileobj(archivo.file, f)
+    # Decodificar archivo base64
+    try:
+        contenido_binario = base64.b64decode(req.archivo_base64)
+        archivo_excel = io.BytesIO(contenido_binario)
+        wb = load_workbook(archivo_excel)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error al procesar Excel: {str(e)}")
 
-    wb = load_workbook(temp.name)
     ws_ocu = wb["Ocupación"]
     ws_asig = wb["Asignaciones"] if "Asignaciones" in wb.sheetnames else wb.create_sheet("Asignaciones")
     ws_disp = wb["Disponibilidad"] if "Disponibilidad" in wb.sheetnames else wb.create_sheet("Disponibilidad")
 
-    # Leer ocupación
     ocupacion = {}
     mes_actual = datetime.now().month
     for row in ws_ocu.iter_rows(min_row=2, values_only=True):
@@ -46,36 +54,31 @@ async def asignar_plan(plan: str = Form(...), archivo: UploadFile = Form(...)):
             horas = 0
         ocupacion[rol] = horas
 
-    # Verificar capacidad
     asignacion_binaria = {}
     for rol in tiempo_por_rol:
-        req = tiempo_por_rol[rol][plan]
-        total = ocupacion.get(rol, 0) + req
+        req_horas = tiempo_por_rol[rol][plan]
+        total = ocupacion.get(rol, 0) + req_horas
         if total <= HORAS_MENSUALES:
-            asignacion_binaria[rol] = 1 if req > 0 else 0
+            asignacion_binaria[rol] = 1 if req_horas > 0 else 0
             ocupacion[rol] = total
         else:
             asignacion_binaria[rol] = 0
 
-    # Si algún rol esencial (con req > 0) no fue asignado, rechazar
     for rol in tiempo_por_rol:
         if tiempo_por_rol[rol][plan] > 0 and asignacion_binaria[rol] == 0:
             raise HTTPException(status_code=409, detail=f"No hay disponibilidad suficiente para {rol}")
 
-    # Escribir asignación
     next_row = ws_asig.max_row + 1 if ws_asig.max_row > 1 else 2
     if next_row == 2:
         ws_asig.append(["Proyecto", "Plan"] + list(tiempo_por_rol.keys()))
     fila = [next_row - 1, plan] + [asignacion_binaria[rol] for rol in tiempo_por_rol.keys()]
     ws_asig.append(fila)
 
-    # Escribir nueva ocupación
     for i, rol in enumerate(tiempo_por_rol.keys(), start=2):
         ws_ocu[f"B{i}"] = ocupacion[rol]
         ws_ocu[f"C{i}"] = mes_actual
 
-    # Calcular disponibilidad por tipo de plan
-    disponibilidad = {"Plata": 999, "Gold": 999, "Platinum": 999}  # límite virtual
+    disponibilidad = {"Plata": 999, "Gold": 999, "Platinum": 999}
     for plan_tipo in ["Plata", "Gold", "Platinum"]:
         min_posibles = 999
         for rol in tiempo_por_rol:
@@ -90,10 +93,15 @@ async def asignar_plan(plan: str = Form(...), archivo: UploadFile = Form(...)):
     for p in ["Platinum", "Gold", "Plata"]:
         ws_disp.append([p, disponibilidad[p]])
 
-    wb.save(temp.name)
+    # Guardar a binario y codificar de nuevo
+    output_stream = io.BytesIO()
+    wb.save(output_stream)
+    output_stream.seek(0)
+    base64_resultado = base64.b64encode(output_stream.read()).decode("utf-8")
 
-    return JSONResponse({
+    return {
         "mensaje": f"Proyecto {next_row - 1} asignado correctamente.",
         "ocupacion_actual": ocupacion,
-        "disponibilidad": disponibilidad
-    })
+        "disponibilidad": disponibilidad,
+        "archivo_actualizado_base64": base64_resultado
+    }
